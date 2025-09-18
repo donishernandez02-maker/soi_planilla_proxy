@@ -1,0 +1,7 @@
+﻿.venv/
+__pycache__/
+*.pyc
+ms-playwright/
+.vscode/
+.DS_Store
+Thumbs.db
