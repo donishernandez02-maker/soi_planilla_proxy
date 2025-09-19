@@ -1,237 +1,94 @@
-# app/main.py
+from __future__ import annotations
+import os, re, sys, time, asyncio, unicodedata
+from typing import Dict, Any
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
-# --- Fix Windows: Playwright necesita un event loop que soporte subprocess ---
-import sys, asyncio
 if sys.platform.startswith("win"):
     try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # type: ignore
     except Exception:
         pass
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, field_validator
-from typing import Any, Dict
-import base64, time, os, re
+SOI_URL = os.getenv("SOI_URL", "https://servicio.nuevosoi.com.co/soi/pagoPlanillaPSEHomeComercial.do")
+CORS_ALLOWED = os.getenv("CORS_ALLOWED", "")
+ALLOW_ORIGINS = [o.strip() for o in CORS_ALLOWED.split(",") if o.strip()] if CORS_ALLOWED else ["*"]
 
-# Playwright (API síncrona para mantener el ejemplo simple)
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-# Parser HTML (solo para obtener el texto lineal)
-from bs4 import BeautifulSoup
-
-
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
-
-SOI_URL = os.getenv(
-    "SOI_URL",
-    "https://servicio.nuevosoi.com.co/soi/pagoPlanillaPSEHomeComercial.do"
-)
-
-app = FastAPI(
-    title="SOI Planilla Proxy",
-    description="Wrapper legal que envía el formulario público de SOI y parsea el resultado.",
-    version="1.2.0",
-)
-
-
-# ------------------------------------------------------------------------------
-# Modelos
-# ------------------------------------------------------------------------------
+app = FastAPI(title="SOI Planilla Proxy", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class ConsultaRequest(BaseModel):
     correo: EmailStr
     numero_planilla: str
 
-    @field_validator("numero_planilla")
-    @classmethod
-    def only_digits(cls, v: str) -> str:
-        v = v.strip()
-        if not v.isdigit():
-            raise ValueError("numero_planilla debe contener solo dígitos")
-        if len(v) > 20:
-            raise ValueError("numero_planilla demasiado largo (máx 20)")
-        return v
+def _strip_accents(t:str)->str:
+    t = unicodedata.normalize("NFKD", t)
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
 
+def _clean(t:str)->str:
+    return re.sub(r"\s+"," ",t).strip()
 
-# ------------------------------------------------------------------------------
-# Utils
-# ------------------------------------------------------------------------------
-
-def b64_png(page) -> str:
-    png = page.screenshot(full_page=True)
-    return base64.b64encode(png).decode("utf-8")
-
-def first_kb(html: str, kb: int = 8) -> str:
-    return html[: kb * 1024]
-
-def has_search_result(html: str) -> bool:
-    low = html.lower()
-    needles = [
-        "resultado de la búsqueda",
-        "resultado de la busqueda",
-        "valor a pagar",
-        "día de pago efectivo",
-        "dia de pago efectivo",
-        "información de la planilla",
-        "informacion de la planilla",
-    ]
-    return any(n in low for n in needles)
-
-def _text_clean(s: str) -> str:
-    # Normaliza NBSP y espacios
-    s = s.replace("\xa0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def parse_result_html(html: str) -> Dict[str, Any]:
-    """
-    Parser robusto por regex: convierte el HTML a texto lineal y extrae
-    campos por patrones cercanos a las etiquetas visibles.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    full_text = " ".join(list(soup.stripped_strings))
-    full_text = _text_clean(full_text)
-
-    out: Dict[str, Any] = {}
-
-    # Razón social (entre esa etiqueta y la siguiente conocida)
-    m = re.search(
-        r"(Raz[oó]n Social\s*/\s*Nombres y Apellidos del Aportante:\s*)(.*?)(?:\s+Periodo Liquidaci[oó]n Salud:)",
-        full_text, flags=re.IGNORECASE
-    )
-    if m:
-        out["razon_social"] = _text_clean(m.group(2))
-
-    # Periodo Liquidación Salud: YYYY-MM
-    m = re.search(r"Periodo Liquidaci[oó]n Salud:\s*([0-9]{4}-[0-9]{2})", full_text, flags=re.IGNORECASE)
-    if m:
-        out["periodo_salud"] = m.group(1)
-
-    # Tipo de Planilla: valor corto (letra/número)
-    m = re.search(r"Tipo de Planilla:\s*([A-Za-z0-9]+)", full_text, flags=re.IGNORECASE)
-    if m:
-        out["tipo_planilla"] = m.group(1)
-
-    # Días de Mora: número
-    m = re.search(r"D[ií]as de Mora:\s*([0-9]+)", full_text, flags=re.IGNORECASE)
-    if m:
-        out["dias_mora"] = m.group(1)
-
-    # Valor Mora: $ X
-    m = re.search(r"Valor Mora:\s*\$?\s*([\d\.\,]+)", full_text, flags=re.IGNORECASE)
-    if m:
-        out["valor_mora"] = f"$ {m.group(1)}"
-
-    # Día de Pago Efectivo: YYYY-MM-DD
-    m = re.search(r"D[ií]a de Pago Efectivo:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", full_text, flags=re.IGNORECASE)
-    if m:
-        out["dia_pago_efectivo"] = m.group(1)
-
-    # Valor a Pagar: $ X
-    m = re.search(r"Valor a Pagar:\s*\$?\s*([\d\.\,]+)", full_text, flags=re.IGNORECASE)
-    if m:
-        out["valor_a_pagar"] = f"$ {m.group(1)}"
-
+def parse_result_html(html:str)->Dict[str,Any]:
+    s = BeautifulSoup(html, "html.parser")
+    txt = _clean(_strip_accents(s.get_text(separator=" ", strip=True)).lower())
+    labels = {
+        "razon_social":"razon social / nombres y apellidos del aportante:",
+        "periodo_salud":"periodo liquidacion salud:",
+        "tipo_planilla":"tipo de planilla:",
+        "dias_mora":"dias de mora:",
+        "valor_mora":"valor mora:",
+        "dia_pago_efectivo":"dia de pago efectivo:",
+        "valor_a_pagar":"valor a pagar:",
+    }
+    order=[labels[k] for k in ["razon_social","periodo_salud","tipo_planilla","dias_mora","valor_mora","dia_pago_efectivo","valor_a_pagar"]]
+    def between(lbl, after):
+        try: start=txt.index(lbl)+len(lbl)
+        except ValueError: return None
+        ends=[txt.find(a,start) for a in after if txt.find(a,start)!=-1]
+        end=min(ends) if ends else len(txt)
+        return _clean(txt[start:end])
+    out={}
+    keys=["razon_social","periodo_salud","tipo_planilla","dias_mora","valor_mora","dia_pago_efectivo","valor_a_pagar"]
+    for i,k in enumerate(keys):
+        v = between(labels[k], order[i+1:]) or ""
+        if k in ("valor_mora","valor_a_pagar"):
+            m=re.search(r"\$?\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?", v); v=m.group(0) if m else v
+        if k=="dias_mora":
+            m=re.search(r"\b\d+\b", v); v=m.group(0) if m else v
+        out[k]= v or None
+    if not out.get("razon_social") and not out.get("valor_a_pagar"):
+        raise ValueError("No se encontró resultado")
     return out
 
+def consultar_soi(correo:str, numero_planilla:str)->Dict[str,Any]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(viewport={"width":1366,"height":900}, locale="es-CO")
+        page = ctx.new_page()
+        page.goto(SOI_URL, wait_until="domcontentloaded", timeout=60000)
+        page.fill("#correoElectronico", correo)
+        page.fill("#numeroPlanilla", numero_planilla)
+        page.click("input[name='buscarPlanilla']")
+        try: page.wait_for_load_state("networkidle", timeout=25000)
+        except Exception: pass
+        html = page.content()
+        ctx.close(); browser.close()
+    return parse_result_html(html)
 
-# ------------------------------------------------------------------------------
-# Endpoint
-# ------------------------------------------------------------------------------
+@app.get("/health")
+def health(): return {"status":"ok"}
 
 @app.post("/planillas/consultar")
-def consultar(req: ConsultaRequest):
-    t0 = time.time()
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ])
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"),
-            viewport={"width": 1366, "height": 900},
-        )
-        page = context.new_page()
-        try:
-            page.goto(SOI_URL, wait_until="domcontentloaded", timeout=30000)
-
-            # Completar campos visibles
-            page.fill("#correoElectronico", req.correo)
-            page.fill("#numeroPlanilla", req.numero_planilla)
-
-            # Click en "Buscar"
-            clicked = False
-            for sel in ["#btnBuscar", "input[name='buscarPlanilla']", "input[value='Buscar']"]:
-                try:
-                    page.click(sel, timeout=2000)
-                    clicked = True
-                    break
-                except PWTimeout:
-                    continue
-            if not clicked:
-                # Fallback: submit del form
-                try:
-                    page.evaluate("document.getElementById('formPagarPSEPago').submit();")
-                except Exception:
-                    pass
-
-            # Espera de red/render
-            page.wait_for_load_state("networkidle", timeout=20000)
-            html = page.content().replace("&nbsp;", " ")
-
-            # Detecta captcha/intersticial SOLO si no vemos un resultado claro
-            low = html.lower()
-            seen_captcha = ("g-recaptcha" in low or "recaptcha" in low or "are you a robot" in low or "captcha" in low)
-            if seen_captcha and not has_search_result(html):
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "ok": False,
-                        "error": "captcha_or_interstitial",
-                        "screenshot_png": b64_png(page),
-                        "html_snippet": first_kb(html),
-                        "meta": {"elapsed_ms": int((time.time() - t0) * 1000)},
-                    },
-                )
-
-            # Parseo de campos
-            parsed = parse_result_html(html)
-
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": True,
-                    "data": parsed,
-                    "meta": {"elapsed_ms": int((time.time() - t0) * 1000)},
-                },
-            )
-
-        except PWTimeout as e:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": "timeout",
-                    "detail": str(e),
-                    "screenshot_png": b64_png(page),
-                    "meta": {"elapsed_ms": int((time.time() - t0) * 1000)},
-                },
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": "unexpected_error",
-                    "detail": str(e),
-                    "meta": {"elapsed_ms": int((time.time() - t0) * 1000)},
-                },
-            )
-        finally:
-            context.close()
-            browser.close()
+def consultar(req:ConsultaRequest):
+    t=time.perf_counter()
+    try:
+        data=consultar_soi(req.correo, req.numero_planilla)
+        return JSONResponse({"ok":True,"data":data,"meta":{"elapsed_ms":int((time.perf_counter()-t)*1000)}})
+    except ValueError as ve:
+        return JSONResponse({"ok":False,"error":str(ve),"meta":{"elapsed_ms":int((time.perf_counter()-t)*1000)}}, status_code=422)
+    except Exception as e:
+        return JSONResponse({"ok":False,"error":f"unexpected_error: {e.__class__.__name__}","meta":{"elapsed_ms":int((time.perf_counter()-t)*1000)}}, status_code=500)
